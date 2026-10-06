@@ -343,7 +343,7 @@ def _user_ticket_text(order: dict) -> str:
     media_count = len(order.get("media", []))
     return (
         f"🎫 <b>Тикет #{order['order_id']}</b>\n\n"
-        f"• Статус: <b>{status_map.get(order['status'], "Неизвестный статус")}</b>\n"
+        f"• Статус: <b>{status_map.get(order['status'], 'Неизвестный статус')}</b>\n"
         f"• Город: <b>{escape(order['city_name'])}</b>\n"
         f"• Вес: <b>{order['weight_kg']} кг</b>\n"
         f"• Сумма: <b>{order['total_rub']:.2f} ₽</b>\n"
