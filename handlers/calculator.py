@@ -1,3 +1,5 @@
+import math
+
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
@@ -43,7 +45,7 @@ async def back_to_city(message: Message, state: FSMContext):
 async def process_price(message: Message, state: FSMContext):
     try:
         price = float((message.text or "").replace(",", ".").strip())
-        if price <= 0:
+        if not math.isfinite(price) or price <= 0:
             raise ValueError
     except ValueError:
         await message.answer("❌ Введите корректное число (стоимость в ¥):")
@@ -60,7 +62,7 @@ async def process_price(message: Message, state: FSMContext):
 async def process_weight(message: Message, state: FSMContext):
     try:
         weight = float((message.text or "").replace(",", ".").strip())
-        if weight <= 0:
+        if not math.isfinite(weight) or weight <= 0:
             raise ValueError
     except ValueError:
         await message.answer("❌ Введите корректный вес в кг (например: <code>1.3</code>):")
