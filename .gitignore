@@ -4,3 +4,6 @@ __pycache__/
 .venv/
 venv/
 *.log
+
+# Runtime SQLite database and sidecar files
+data/bot.db*

@@ -43,7 +43,7 @@ def _admin_ids() -> tuple[int, ...]:
 class Config:
     bot_token: str = os.getenv("BOT_TOKEN", "").strip()
     admin_ids: tuple[int, ...] = _admin_ids()
-    db_path: Path = BASE_DIR / "data" / "bot.db"
+    db_path: Path = Path(os.getenv("DB_PATH", str(BASE_DIR / "data" / "bot.db"))).expanduser()
     legacy_cny_low: float = 13.6
     legacy_cny_high: float = 13.3
     legacy_usd: float = 93.0

@@ -1,4 +1,5 @@
 import logging
+import math
 import re
 from html import escape
 
@@ -134,7 +135,7 @@ async def process_item(message: Message, state: FSMContext):
 async def process_price(message: Message, state: FSMContext):
     try:
         price = float((message.text or "").replace(",", ".").strip())
-        if price <= 0:
+        if not math.isfinite(price) or price <= 0:
             raise ValueError
     except ValueError:
         await message.answer("❌ Введите корректное число (цена в ¥):")
@@ -151,7 +152,7 @@ async def process_price(message: Message, state: FSMContext):
 async def process_weight(message: Message, state: FSMContext):
     try:
         weight = float((message.text or "").replace(",", ".").strip())
-        if weight <= 0:
+        if not math.isfinite(weight) or weight <= 0:
             raise ValueError
     except ValueError:
         await message.answer("❌ Введите корректный вес (в кг):")
