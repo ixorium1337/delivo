@@ -199,15 +199,6 @@ class Database:
             )
 
     @staticmethod
-    def _reset_sequence(conn: sqlite3.Connection, table: str, id_column: str) -> None:
-        """Не учитывать уже удалённые максимальные номера AUTOINCREMENT."""
-        max_id = int(conn.execute(f"SELECT COALESCE(MAX({id_column}), 0) AS n FROM {table}").fetchone()["n"])
-        if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_sequence'").fetchone():
-            conn.execute("DELETE FROM sqlite_sequence WHERE name=?", (table,))
-            if max_id:
-                conn.execute("INSERT INTO sqlite_sequence(name, seq) VALUES(?, ?)", (table, max_id))
-
-    @staticmethod
     def _cargo_sort_key(order: dict) -> tuple:
         shipment = order.get("shipment")
         if not shipment:
@@ -531,18 +522,18 @@ class Database:
                 return None
             order = self._with_order_details(conn, order)
             conn.execute("DELETE FROM orders WHERE order_id=?", (int(order_id),))
-            self._reset_sequence(conn, "orders", "order_id")
-            self._reset_sequence(conn, "order_media", "id")
+
+
             return order
 
     def clear_orders_and_shipments(self) -> None:
-        """Полная очистка рабочих сущностей с возвратом нумерации к 1."""
+        """Полная очистка заказов и отправлений."""
         with self._connect() as conn:
             conn.execute("DELETE FROM orders")
             conn.execute("DELETE FROM shipments")
-            self._reset_sequence(conn, "orders", "order_id")
-            self._reset_sequence(conn, "shipments", "id")
-            self._reset_sequence(conn, "order_media", "id")
+
+
+
 
     def pool_info(self) -> dict:
         with self._connect() as conn:
@@ -677,7 +668,7 @@ class Database:
                         (1 if order["city_code"] == "vlg" else 0, order["order_id"]),
                     )
             conn.execute("DELETE FROM shipments WHERE id=?", (int(shipment_id),))
-            self._reset_sequence(conn, "shipments", "id")
+
             return result
 
 
