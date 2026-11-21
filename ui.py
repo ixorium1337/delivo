@@ -1,17 +1,63 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
+from config import config
 
-def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
-    keyboard = [
-        [KeyboardButton(text="🧮 Калькулятор стоимости"), KeyboardButton(text="📈 Текущий курс")],
-        [KeyboardButton(text="📦 Оформить заказ"), KeyboardButton(text="📋 Мои заказы")],
-        [KeyboardButton(text="🔔 Пул ВЛГ"), KeyboardButton(text="ℹ️ О сервисе")],
+HOME_TEXT = "⬅️ Назад в меню"
+
+
+def home_button(label: str = HOME_TEXT) -> InlineKeyboardButton:
+    return InlineKeyboardButton(text=label, callback_data="menu:home")
+
+
+def back_to_menu_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[home_button()]])
+
+
+def manager_contact_keyboard(extra_rows: list[list[InlineKeyboardButton]] | None = None) -> InlineKeyboardMarkup:
+    rows = list(extra_rows or [])
+    rows.append([InlineKeyboardButton(text=f"👨‍💻 Написать @{config.manager_username}", url=f"https://t.me/{config.manager_username}")])
+    rows.append([home_button()])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _link_button(label: str, url: str, callback_data: str) -> InlineKeyboardButton:
+    if url:
+        return InlineKeyboardButton(text=label, url=url)
+    return InlineKeyboardButton(text=label, callback_data=callback_data)
+
+
+def main_menu(
+    is_admin: bool = False,
+    extra_rows: list[list[InlineKeyboardButton]] | None = None,
+) -> InlineKeyboardMarkup:
+    """Главное меню в стиле стартовой карточки (inline)."""
+    rows = [
+        [InlineKeyboardButton(text="📦 Новый заказ", callback_data="menu:new_order")],
+        [
+            InlineKeyboardButton(text="📔 Мои заказы", callback_data="menu:my_orders"),
+            InlineKeyboardButton(text="🧮 Калькулятор", callback_data="menu:calc"),
+        ],
+        [
+            InlineKeyboardButton(text="🇨🇳 Курс ¥ / $", callback_data="menu:rates"),
+            InlineKeyboardButton(text="📖 Справка", callback_data="menu:help"),
+        ],
+        [
+            InlineKeyboardButton(text="🔍 Подбор", callback_data="menu:selection"),
+            InlineKeyboardButton(text="🔔 Пул ВЛГ", callback_data="menu:pool"),
+        ],
+        [
+            InlineKeyboardButton(text="👨‍💻 Менеджер", callback_data="menu:manager"),
+            InlineKeyboardButton(text="⚡ Быстрые ответы", callback_data="menu:faq"),
+        ],
+        [
+            _link_button("📡 Канал", config.channel_url, "menu:channel"),
+            _link_button("⭐ Отзывы", config.reviews_url, "menu:reviews"),
+        ],
     ]
+    rows.extend(extra_rows or [])
     if is_admin:
-        keyboard.append([KeyboardButton(text="⚙️ Админка")])
-    else:
-        keyboard.append([KeyboardButton(text="📖 Гайд клиента")])
-    return ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True)
+        rows.append([InlineKeyboardButton(text="⚙️ Админка", callback_data="menu:admin")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def step_menu(has_back: bool = True) -> ReplyKeyboardMarkup:
@@ -45,10 +91,8 @@ def delivery_keyboard(city_code: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def order_from_calc_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="📦 Оформить этот заказ", callback_data="order_from_calc")
-    ]])
+def order_from_calc_row() -> list[InlineKeyboardButton]:
+    return [InlineKeyboardButton(text="📦 Оформить этот заказ", callback_data="order_from_calc")]
 
 
 def user_history_keyboard(orders: list[dict] | None = None) -> InlineKeyboardMarkup:
@@ -57,13 +101,15 @@ def user_history_keyboard(orders: list[dict] | None = None) -> InlineKeyboardMar
         media_count = len(order.get("media", []))
         suffix = f" · 📷 {media_count}" if media_count else ""
         buttons.append([InlineKeyboardButton(text=f"🎫 Открыть тикет #{order['order_id']}{suffix}", callback_data=f"user_order_view:{order['order_id']}")])
+    buttons.append([home_button()])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 def user_ticket_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="⬅️ К истории заказов", callback_data="user_orders_back")
-    ]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ К истории заказов", callback_data="user_orders_back")],
+        [home_button()],
+    ])
 
 
 def user_ticket_notice_keyboard(order_id: int) -> InlineKeyboardMarkup:
@@ -79,7 +125,24 @@ def pool_notifications_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     else:
         text = "🔔 Включить уведомления пула"
         data = "pool_notify:on"
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=text, callback_data=data)]])
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=text, callback_data=data)],
+        [home_button()],
+    ])
+
+
+def rate_notifications_keyboard(enabled: bool, include_home: bool = True) -> InlineKeyboardMarkup:
+    prefix = "rate_notify" if include_home else "rate_notify_msg"
+    if enabled:
+        text = "🔕 Отключить уведомления о курсе"
+        data = f"{prefix}:off"
+    else:
+        text = "🔔 Включить уведомления о курсе"
+        data = f"{prefix}:on"
+    rows = [[InlineKeyboardButton(text=text, callback_data=data)]]
+    if include_home:
+        rows.append([home_button()])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def manager_ticket_keyboard(order_id: int) -> InlineKeyboardMarkup:
@@ -112,9 +175,13 @@ def admin_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📈 Курсы валют", callback_data="admin_menu_rates")],
         [InlineKeyboardButton(text="🎫 Управление тикетами", callback_data="admin_menu_tickets")],
         [InlineKeyboardButton(text="🚚 Рейсы и отправления", callback_data="admin_shipments_menu")],
+        [InlineKeyboardButton(text="📊 База Excel (скачать / загрузить)", callback_data="admin_excel_menu")],
         [InlineKeyboardButton(text="👥 Клиенты (бан/разбан)", callback_data="admin_menu_users")],
         [InlineKeyboardButton(text="📚 Гайд администратора", callback_data="admin_guide")],
-        [InlineKeyboardButton(text="❌ Закрыть панель", callback_data="admin_close")],
+        [
+            InlineKeyboardButton(text="🏠 В главное меню", callback_data="menu:home"),
+            InlineKeyboardButton(text="❌ Закрыть панель", callback_data="admin_close"),
+        ],
     ])
 
 
@@ -292,9 +359,27 @@ def admin_users_keyboard() -> InlineKeyboardMarkup:
 
 def accepted_db_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📥 Скачать базу (.txt)", callback_data="admin_export_accepted_txt")],
+        [
+            InlineKeyboardButton(text="📥 Скачать (.txt)", callback_data="admin_export_accepted_txt"),
+            InlineKeyboardButton(text="📊 Полная БД (.xlsx)", callback_data="admin_export_excel"),
+        ],
         [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin_back_main")],
     ])
+
+
+def admin_excel_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📥 Скачать базу (.xlsx)", callback_data="admin_export_excel")],
+        [InlineKeyboardButton(text="📤 Загрузить заказы (.xlsx)", callback_data="admin_import_excel")],
+        [InlineKeyboardButton(text="⬅️ Назад в админку", callback_data="admin_back_main")],
+    ])
+
+
+def admin_excel_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Добавить заказы в БД", callback_data="admin_excel_confirm"),
+        InlineKeyboardButton(text="❌ Отмена", callback_data="admin_excel_cancel"),
+    ]])
 
 
 def pool_manage_keyboard() -> InlineKeyboardMarkup:

@@ -5,7 +5,7 @@ from html import escape
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 
 import texts
 from calculator import PRICE_LIMIT_JOKE, WEIGHT_LIMIT_JOKE, calculate_order
@@ -92,6 +92,16 @@ async def start_from_calc(callback: CallbackQuery, state: FSMContext):
     await state.set_state(OrderStates.waiting_for_item)
     if callback.message:
         await callback.message.answer(texts.ORDER_FROM_CALC, reply_markup=step_menu(False))
+    await callback.answer()
+
+
+@router.callback_query(F.data == "menu:new_order")
+async def start_direct_callback(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.update_data(from_calc=False)
+    await state.set_state(OrderStates.waiting_for_item)
+    if callback.message:
+        await callback.message.answer(texts.ORDER_START, reply_markup=step_menu(False))
     await callback.answer()
 
 
@@ -258,7 +268,8 @@ async def process_phone(message: Message, state: FSMContext):
     required = {"city_name", "city_code", "weight_kg", "price_cny", "goods_rub", "service_fee_rub", "usd_rate", "total_rub", "delivery_method"}
     if not required.issubset(last_calc):
         await state.clear()
-        await message.answer("Данные расчёта устарели. Оформите заказ заново.", reply_markup=main_menu(config.is_admin(message.from_user.id)))
+        await message.answer("Данные расчёта устарели. Оформите заказ заново.", reply_markup=ReplyKeyboardRemove())
+        await message.answer(texts.MAIN_MENU, reply_markup=main_menu(config.is_admin(message.from_user.id)))
         return
     details = data.get("order_details", "Не указано")
     item_desc = details
@@ -311,17 +322,37 @@ async def process_phone(message: Message, state: FSMContext):
     await state.clear()
     await message.answer(
         texts.customer_order_created(order_id, last_calc["total_rub"], last_calc["city_name"], last_calc["weight_kg"], last_calc["delivery_method"]),
-        reply_markup=main_menu(config.is_admin(message.from_user.id)),
+        reply_markup=ReplyKeyboardRemove(),
     )
+    await message.answer(texts.MAIN_MENU, reply_markup=main_menu(config.is_admin(message.from_user.id)))
+
+
+@router.callback_query(F.data == "menu:my_orders")
+async def show_user_orders_callback(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await _send_user_orders(callback.from_user.id, callback)
+    await callback.answer()
 
 
 @router.message(F.text.contains("Мои заказы"))
-async def show_user_orders(message: Message):
-    orders = db.get_user_orders(message.from_user.id)
+async def show_user_orders(message: Message, state: FSMContext):
+    await state.clear()
+    await _send_user_orders(message.from_user.id, message)
+
+
+async def _send_user_orders(user_id: int, target: Message | CallbackQuery) -> None:
+    orders = db.get_user_orders(user_id)
     if not orders:
-        await message.answer("📋 У вас пока нет оформленных заказов в истории.", reply_markup=main_menu(config.is_admin(message.from_user.id)))
+        text = "📋 У вас пока нет оформленных заказов в истории."
+        markup = user_history_keyboard([])
+    else:
+        text = texts.user_orders(orders)
+        markup = user_history_keyboard(orders)
+    if isinstance(target, CallbackQuery):
+        if target.message:
+            await target.message.answer(text, reply_markup=markup)
         return
-    await message.answer(texts.user_orders(orders), reply_markup=user_history_keyboard(orders))
+    await target.answer(text, reply_markup=markup)
 
 
 def _user_ticket_text(order: dict) -> str:

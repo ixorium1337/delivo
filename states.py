@@ -21,6 +21,8 @@ class OrderStates(StatesGroup):
 
 
 class AdminStates(StatesGroup):
+    waiting_for_excel_import = State()
+    waiting_for_excel_confirm = State()
     waiting_for_broker_cny = State()
     waiting_for_cny_low = State()
     waiting_for_cny_high = State()

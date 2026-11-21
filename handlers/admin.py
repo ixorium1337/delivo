@@ -6,16 +6,26 @@ from aiogram import F, Router
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from datetime import datetime
+from aiogram.filters import Command, StateFilter
+from excel_io import export_database_to_excel, parse_orders_excel
 
 import texts
 from config import config
 from database import db
 from middleware import AdminFilter
-from notifications import notify_admin_order_resolution, notify_pool_change, sync_admin_order_notification_buttons
+from notifications import (
+    notify_admin_order_resolution,
+    notify_pool_change,
+    notify_rate_change,
+    sync_admin_order_notification_buttons,
+)
 from states import AdminStates
 from ui import (
     accepted_db_keyboard,
     admin_cancel_keyboard,
+    admin_excel_confirm_keyboard,  
+    admin_excel_keyboard,         
     admin_keyboard,
     admin_order_card_keyboard,
     admin_order_delete_confirm_keyboard,
@@ -29,7 +39,6 @@ from ui import (
     admin_rates_keyboard,
     admin_tickets_keyboard,
     admin_users_keyboard,
-    main_menu,
     pool_manage_keyboard,
     pool_notifications_keyboard,
     shipment_card_keyboard,
@@ -104,6 +113,17 @@ async def admin_main(message: Message, state: FSMContext):
     await message.answer("⚙️ <b>Панель администратора</b>\n\nВыберите нужный раздел управления:", reply_markup=admin_keyboard())
 
 
+@router.callback_query(F.data == "menu:admin")
+async def admin_from_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if callback.message:
+        await callback.message.answer(
+            "⚙️ <b>Панель администратора</b>\n\nВыберите нужный раздел управления:",
+            reply_markup=admin_keyboard(),
+        )
+    await callback.answer()
+
+
 @router.callback_query(F.data == "admin_back_main")
 async def admin_back_main(callback: CallbackQuery, state: FSMContext):
     await state.clear()
@@ -132,8 +152,31 @@ async def admin_guide_section(callback: CallbackQuery):
     await callback.answer()
 
 
+RATE_STATES = {
+    AdminStates.waiting_for_broker_cny.state,
+    AdminStates.waiting_for_cny_low.state,
+    AdminStates.waiting_for_cny_high.state,
+    AdminStates.waiting_for_usd.state,
+}
+
+
+def _rates_menu_text() -> str:
+    rates = db.get_rates()
+    return (
+        "📈 <b>Управление курсами валют</b>\n\n"
+        f"• CNY (&lt; 5 000 ₽): <b>{texts.format_rate(rates['cny_low'])} ₽</b>\n"
+        f"• CNY (≥ 5 000 ₽): <b>{texts.format_rate(rates['cny_high'])} ₽</b>\n"
+        f"• USD: <b>{texts.format_rate(rates['usd'])} ₽</b>\n\n"
+        "<i>Расчёт выкупа автоматически использует курс CNY до или от 5 000 ₽. Курс посредника в расчёте не участвует.</i>"
+    )
+
+
 @router.callback_query(F.data == "admin_cancel")
 async def admin_cancel(callback: CallbackQuery, state: FSMContext):
+    if await state.get_state() in RATE_STATES:
+        await state.clear()
+        await admin_rates(callback)
+        return
     await admin_back_main(callback, state)
 
 
@@ -147,22 +190,15 @@ async def admin_close(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "admin_menu_rates")
 async def admin_rates(callback: CallbackQuery):
-    rates = db.get_rates()
-    text = (
-        "📈 <b>Управление курсами валют</b>\n\n"
-        f"• CNY (&lt; 5 000 ₽): <b>{rates['cny_low']:.4f} ₽</b>\n"
-        f"• CNY (≥ 5 000 ₽): <b>{rates['cny_high']:.4f} ₽</b>\n"
-        f"• USD: <b>{rates['usd']:.4f} ₽</b>\n\n"
-        "<i>Расчёт выкупа автоматически использует курс CNY до или от 5 000 ₽. Курс посредника в расчёте не участвует.</i>"
-    )
     if callback.message:
-        await callback.message.edit_text(text, reply_markup=admin_rates_keyboard())
+        await callback.message.edit_text(_rates_menu_text(), reply_markup=admin_rates_keyboard())
     await callback.answer()
 
 
 async def _start_rate(callback: CallbackQuery, state: FSMContext, state_value, prompt: str):
     await state.set_state(state_value)
     if callback.message:
+        await state.update_data(rate_prompt_msg_id=callback.message.message_id)
         await callback.message.edit_text(prompt, reply_markup=admin_cancel_keyboard())
     await callback.answer()
 
@@ -193,11 +229,39 @@ async def _save_rate(message: Message, state: FSMContext, key: str, label: str):
         if not 0 < value < 10000:
             raise ValueError
     except ValueError:
-        await message.answer("❌ Введите положительное число:")
+        await message.answer("❌ Введите положительное число:", reply_markup=admin_cancel_keyboard())
         return
+    data = await state.get_data()
+    prompt_msg_id = data.get("rate_prompt_msg_id")
+    old_value = db.get_rates().get(key)
     db.update_rate(key, value)
     await state.clear()
-    await message.answer(f"✅ {label} сохранён: <b>{value:.4f} ₽</b>\n<i>Новый курс сразу используется в расчётах.</i>")
+    if prompt_msg_id:
+        try:
+            await message.bot.edit_message_reply_markup(
+                chat_id=message.chat.id,
+                message_id=prompt_msg_id,
+                reply_markup=None,
+            )
+        except Exception:
+            pass
+
+    notify_line = ""
+    if key in {"cny_low", "cny_high", "usd"} and old_value is not None:
+        if abs(round(value, 4) - round(float(old_value), 4)) < 0.0001:
+            notify_line = "\n<i>Курс не изменился — уведомления пользователям не отправлялись.</i>"
+        else:
+            sent, failed = await notify_rate_change(message.bot, key, old_value, value)
+            failed_part = f", ошибок доставки: {failed}" if failed else ""
+            notify_line = f"\n📣 <i>Уведомлено пользователей: {sent}{failed_part}.</i>"
+
+    await message.answer(
+        f"✅ {label} сохранён: <b>{texts.format_rate(value)} ₽</b>\n"
+        "<i>Новый курс сразу используется в расчётах.</i>"
+        f"{notify_line}\n\n"
+        + _rates_menu_text(),
+        reply_markup=admin_rates_keyboard(),
+    )
 
 
 @router.message(AdminStates.waiting_for_broker_cny)
@@ -218,7 +282,6 @@ async def save_cny_high(message: Message, state: FSMContext):
 @router.message(AdminStates.waiting_for_usd)
 async def save_usd(message: Message, state: FSMContext):
     await _save_rate(message, state, "usd", "USD")
-
 
 @router.callback_query(F.data == "admin_menu_tickets")
 async def admin_tickets(callback: CallbackQuery):
@@ -1579,3 +1642,195 @@ async def reject_reason(message: Message, state: FSMContext):
         await message.answer(f"Тикет #{order_id} уже обработан другим администратором. Текущий статус: {escape(texts.order_status_label(order['status']))}.")
     else:
         await message.answer(f"✅ Заказ #{order_id} отклонён.")
+def _excel_menu_text() -> str:
+    orders_count = len(db.get_existing_order_ids())
+    shipments_count = len(db.list_all_shipments_for_export())
+    return (
+        "📊 <b>База данных в Excel (.xlsx)</b>\n\n"
+        f"• Заказов в БД: <b>{orders_count}</b>\n"
+        f"• Отправлений в БД: <b>{shipments_count}</b>\n\n"
+        "• <b>Скачать базу (.xlsx)</b> — выгружает все тикеты, трекеры, отправления и лист с инструкцией.\n"
+        "• <b>Загрузить заказы (.xlsx)</b> — бот проверит файл, пропустит уже существующие ID и добавит новые заказы в БД.\n\n"
+        "<i>Также можно просто отправить .xlsx-файл в этот чат (вне других сценариев).</i>"
+    )
+
+
+@router.callback_query(F.data == "admin_excel_menu")
+async def admin_excel_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if callback.message:
+        await callback.message.edit_text(_excel_menu_text(), reply_markup=admin_excel_keyboard())
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_export_excel")
+async def admin_export_excel(callback: CallbackQuery):
+    orders = db.list_all_orders_for_export()
+    shipments = db.list_all_shipments_for_export()
+    content = export_database_to_excel(orders, shipments)
+    filename = f"delivo_db_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+    file = BufferedInputFile(content, filename=filename)
+    if callback.message:
+        await callback.message.answer_document(
+            file,
+            caption=(
+                f"📊 <b>База данных выгружена в Excel</b>\n\n"
+                f"• Тикетов: <b>{len(orders)}</b>\n"
+                f"• Отправлений: <b>{len(shipments)}</b>\n"
+                "Можете дополнить лист «Заказы» и отправить файл боту обратно."
+            ),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data == "admin_import_excel")
+async def admin_import_excel_start(callback: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_for_excel_import)
+    if callback.message:
+        await callback.message.edit_text(
+            "📤 <b>Импорт заказов из Excel</b>\n\n"
+            "Пришлите файл формата <b>.xlsx</b>.\n"
+            "Бот сначала проверит строки и покажет отчёт перед добавлением в базу.\n\n"
+            "<i>Для новых заказов «ID тикета» можно оставить пустым. Существующие ID не перезаписываются.</i>",
+            reply_markup=admin_cancel_keyboard(),
+        )
+    await callback.answer()
+
+
+async def _handle_excel_upload(message: Message, state: FSMContext) -> None:
+    doc = message.document
+    if not doc:
+        await message.answer("Отправьте документ формата .xlsx.", reply_markup=admin_cancel_keyboard())
+        return
+    filename = (doc.file_name or "").strip()
+    if not filename.lower().endswith(".xlsx"):
+        await message.answer(
+            "❌ Поддерживается только формат <b>.xlsx</b> (Excel 2007+).",
+            reply_markup=admin_cancel_keyboard(),
+        )
+        return
+    if doc.file_size and doc.file_size > 10 * 1024 * 1024:
+        await message.answer("❌ Файл слишком большой (максимум 10 МБ).", reply_markup=admin_cancel_keyboard())
+        return
+
+    buf = io.BytesIO()
+    await message.bot.download(doc, destination=buf)
+    parsed = parse_orders_excel(buf.getvalue(), db.get_existing_order_ids())
+
+    if parsed.get("fatal_error"):
+        await state.clear()
+        await message.answer(
+            f"❌ <b>Ошибка чтения файла:</b>\n{escape(parsed['fatal_error'])}",
+            reply_markup=admin_excel_keyboard(),
+        )
+        return
+
+    new_orders = parsed["new_orders"]
+    skipped = parsed["skipped_existing"]
+    errors = parsed["errors"]
+
+    lines = [
+        "📊 <b>Результат проверки Excel-файла</b>\n",
+        f"• Файл: <b>{escape(filename)}</b>",
+        f"• Лист: <b>{escape(parsed['sheet_name'])}</b>",
+        f"• Всего строк просмотрено: <b>{parsed['total_rows']}</b>",
+        f"• Новых заказов к добавлению: <b>{len(new_orders)}</b>",
+        f"• Уже есть в БД (пропущено): <b>{len(skipped)}</b>",
+        f"• Ошибок в строках: <b>{len(errors)}</b>",
+    ]
+
+    if new_orders:
+        lines.append("\n<b>Превью новых заказов:</b>")
+        for item in new_orders[:6]:
+            oid = f"#{item['order_id']}" if item.get("order_id") else "авто-ID"
+            lines.append(
+                f"• <b>{oid}</b> | TG <code>{item['user_id']}</code> | "
+                f"{escape(item['city_name'])} | {item['weight_kg']:.2f} кг | "
+                f"{item['total_rub']:.2f} ₽ | {escape(texts.order_status_label(item['status']))}"
+            )
+        if len(new_orders) > 6:
+            lines.append(f"• …и ещё {len(new_orders) - 6} заказ(ов)")
+
+    if errors:
+        lines.append("\n<b>Ошибки (строки пропущены):</b>")
+        for row_num, reason in errors[:6]:
+            lines.append(f"• Строка {row_num}: {escape(reason)}")
+        if len(errors) > 6:
+            lines.append(f"• …и ещё {len(errors) - 6} ошибок")
+
+    report = "\n".join(lines)
+    if not new_orders:
+        await state.clear()
+        await message.answer(
+            report + "\n\nℹ️ Новых заказов для добавления не найдено.",
+            reply_markup=admin_excel_keyboard(),
+        )
+        return
+
+    await state.set_state(AdminStates.waiting_for_excel_confirm)
+    await state.update_data(
+        excel_import_payload={
+            "orders": new_orders,
+            "shipments": parsed["new_shipments"],
+            "skipped_existing": skipped,
+        }
+    )
+    await message.answer(report, reply_markup=admin_excel_confirm_keyboard())
+
+
+@router.message(AdminStates.waiting_for_excel_import)
+async def admin_import_excel_file(message: Message, state: FSMContext):
+    if not message.document:
+        await message.answer(
+            "Пришлите файл <b>.xlsx</b> как документ или нажмите «Отмена».",
+            reply_markup=admin_cancel_keyboard(),
+        )
+        return
+    await _handle_excel_upload(message, state)
+
+
+@router.message(
+    StateFilter(None),
+    F.document,
+    F.document.file_name.func(lambda name: bool(name and name.lower().endswith(".xlsx"))),
+)
+async def admin_direct_excel_file(message: Message, state: FSMContext):
+    await _handle_excel_upload(message, state)
+
+
+@router.callback_query(AdminStates.waiting_for_excel_confirm, F.data == "admin_excel_confirm")
+async def admin_excel_confirm(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    payload = data.get("excel_import_payload")
+    if not payload:
+        await state.clear()
+        await callback.answer("Данные импорта устарели. Отправьте файл заново.", show_alert=True)
+        return
+
+    res = db.import_orders_and_shipments(payload["orders"], payload.get("shipments"))
+    await state.clear()
+
+    added_ids = res["added_order_ids"]
+    if len(added_ids) <= 15:
+        ids_text = ", ".join(f"#{x}" for x in added_ids) or "—"
+    else:
+        ids_text = f"#{added_ids[0]} … #{added_ids[-1]} ({len(added_ids)} шт.)"
+
+    total_skipped = len(payload.get("skipped_existing", [])) + len(res["skipped_existing"])
+    text = (
+        "✅ <b>Импорт из Excel завершён!</b>\n\n"
+        f"• Добавлено заказов: <b>{res['added_orders']}</b> ({ids_text})\n"
+        f"• Добавлено отправлений: <b>{res['added_shipments']}</b>\n"
+        f"• Пропущено (уже в БД): <b>{total_skipped}</b>"
+    )
+    if callback.message:
+        await callback.message.edit_text(text, reply_markup=admin_excel_keyboard())
+    await callback.answer("Импорт выполнен!")
+
+
+@router.callback_query(F.data == "admin_excel_cancel")
+async def admin_excel_cancel(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    if callback.message:
+        await callback.message.edit_text(_excel_menu_text(), reply_markup=admin_excel_keyboard())
+    await callback.answer("Импорт отменён")

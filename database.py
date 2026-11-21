@@ -95,6 +95,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS user_preferences (
                     user_id INTEGER PRIMARY KEY,
                     pool_notifications INTEGER NOT NULL DEFAULT 1 CHECK(pool_notifications IN (0, 1)),
+                    rate_notifications INTEGER NOT NULL DEFAULT 1 CHECK(rate_notifications IN (0, 1)),
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
@@ -154,6 +155,12 @@ class Database:
             media_columns = self._columns(conn, "order_media")
             if "caption" not in media_columns:
                 conn.execute("ALTER TABLE order_media ADD COLUMN caption TEXT NOT NULL DEFAULT ''")
+
+            pref_columns = self._columns(conn, "user_preferences")
+            if "rate_notifications" not in pref_columns:
+                conn.execute(
+                    "ALTER TABLE user_preferences ADD COLUMN rate_notifications INTEGER NOT NULL DEFAULT 1 CHECK(rate_notifications IN (0, 1))"
+                )
 
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='shipment_orders'").fetchone():
                 links = conn.execute("SELECT shipment_id, order_id FROM shipment_orders").fetchall()
@@ -387,7 +394,7 @@ class Database:
         now = self._now()
         with self._connect() as conn:
             conn.execute(
-                "INSERT OR IGNORE INTO user_preferences(user_id, pool_notifications, created_at, updated_at) VALUES(?, 1, ?, ?)",
+                "INSERT OR IGNORE INTO user_preferences(user_id, pool_notifications, rate_notifications, created_at, updated_at) VALUES(?, 1, 1, ?, ?)",
                 (user_id, now, now),
             )
 
@@ -416,6 +423,44 @@ class Database:
                 WHERE NOT EXISTS (
                     SELECT 1 FROM user_preferences p
                     WHERE p.user_id=o.user_id AND p.pool_notifications=0
+                )
+                ORDER BY user_id
+                """
+            ).fetchall()
+            banned = {int(row["user_id"]) for row in conn.execute("SELECT user_id FROM banned_users").fetchall()}
+        return [
+            int(row["user_id"]) for row in rows
+            if int(row["user_id"]) not in banned and not config.is_admin(int(row["user_id"]))
+        ]
+
+    def rate_notifications_enabled(self, user_id: int) -> bool:
+        self.ensure_user(user_id)
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT rate_notifications FROM user_preferences WHERE user_id=?",
+                (int(user_id),),
+            ).fetchone()
+            return bool(row["rate_notifications"]) if row else True
+
+    def set_rate_notifications(self, user_id: int, enabled: bool) -> None:
+        self.ensure_user(user_id)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE user_preferences SET rate_notifications=?, updated_at=? WHERE user_id=?",
+                (1 if enabled else 0, self._now(), int(user_id)),
+            )
+
+    def rate_notification_recipients(self) -> list[int]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT user_id FROM user_preferences WHERE rate_notifications=1
+                UNION
+                SELECT DISTINCT o.user_id
+                FROM orders o
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM user_preferences p
+                    WHERE p.user_id=o.user_id AND p.rate_notifications=0
                 )
                 ORDER BY user_id
                 """
@@ -849,6 +894,234 @@ class Database:
     def unban(self, user_id: int) -> None:
         with self._connect() as conn:
             conn.execute("DELETE FROM banned_users WHERE user_id=?", (int(user_id),))
+    def list_all_orders_for_export(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM orders ORDER BY order_id ASC").fetchall()
+            return [self._with_order_details(conn, dict(row)) for row in rows]
 
+    def list_all_shipments_for_export(self) -> list[dict]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT * FROM shipments ORDER BY id ASC").fetchall()
+            result = []
+            for row in rows:
+                item = dict(row)
+                order_rows = conn.execute(
+                    "SELECT order_id FROM orders WHERE shipment_id=? ORDER BY order_id ASC",
+                    (item["id"],),
+                ).fetchall()
+                item["order_ids"] = [int(x["order_id"]) for x in order_rows]
+                result.append(item)
+            return result
+
+    def get_existing_order_ids(self) -> set[int]:
+        with self._connect() as conn:
+            rows = conn.execute("SELECT order_id FROM orders").fetchall()
+            return {int(row["order_id"]) for row in rows}
+
+    def import_orders_and_shipments(
+        self,
+        orders: list[dict],
+        shipments: list[dict] | None = None,
+    ) -> dict:
+        added_orders = 0
+        added_order_ids: list[int] = []
+        skipped_existing: list[int] = []
+        added_shipments = 0
+        shipment_id_map: dict[int, int] = {}
+        now = self._now()
+
+        with self._connect() as conn:
+            existing_order_ids = {
+                int(row["order_id"])
+                for row in conn.execute("SELECT order_id FROM orders").fetchall()
+            }
+            existing_shipments = {
+                int(row["id"]): dict(row)
+                for row in conn.execute("SELECT * FROM shipments").fetchall()
+            }
+
+            for ship in shipments or []:
+                old_id = ship.get("id")
+                city_name = str(ship.get("city_name") or "").strip()[:100]
+                name = str(ship.get("name") or "").strip()[:200]
+                track_number = str(ship.get("track_number") or "").strip()[:200]
+                status = str(ship.get("status") or "forming").strip()
+                if status not in self.SHIPMENT_STATUSES:
+                    status = "forming"
+                created_at = str(ship.get("created_at") or now)[:50]
+                arrived_at = ship.get("arrived_at")
+                arrived_at = str(arrived_at)[:50] if arrived_at else None
+
+                if not city_name or not name:
+                    continue
+
+                if old_id and int(old_id) in existing_shipments:
+                    cur_ship = existing_shipments[int(old_id)]
+                    if (
+                        cur_ship["city_name"] == city_name
+                        and cur_ship["track_number"] == track_number
+                    ):
+                        shipment_id_map[int(old_id)] = int(old_id)
+                        continue
+
+                matched_id = None
+                for sid, cur_ship in existing_shipments.items():
+                    if (
+                        cur_ship["city_name"] == city_name
+                        and cur_ship["name"] == name
+                        and cur_ship["track_number"] == track_number
+                    ):
+                        matched_id = sid
+                        break
+                if matched_id is not None:
+                    if old_id:
+                        shipment_id_map[int(old_id)] = matched_id
+                    continue
+
+                if old_id and int(old_id) > 0 and int(old_id) not in existing_shipments:
+                    conn.execute(
+                        """
+                        INSERT INTO shipments(id, city_name, name, track_number, status, created_at, arrived_at, status_updated_at)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (int(old_id), city_name, name, track_number, status, created_at, arrived_at, now),
+                    )
+                    new_sid = int(old_id)
+                else:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO shipments(city_name, name, track_number, status, created_at, arrived_at, status_updated_at)
+                        VALUES(?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (city_name, name, track_number, status, created_at, arrived_at, now),
+                    )
+                    new_sid = int(cur.lastrowid)
+
+                existing_shipments[new_sid] = {
+                    "id": new_sid,
+                    "city_name": city_name,
+                    "name": name,
+                    "track_number": track_number,
+                    "status": status,
+                }
+                if old_id:
+                    shipment_id_map[int(old_id)] = new_sid
+                added_shipments += 1
+
+            # Сначала записи с явным order_id, затем без ID — чтобы AUTOINCREMENT не конфликтовал.
+            ordered_items = [x for x in orders if x.get("order_id") is not None] + [
+                x for x in orders if x.get("order_id") is None
+            ]
+
+            for item in ordered_items:
+                explicit_id = item.get("order_id")
+                if explicit_id is not None:
+                    explicit_id = int(explicit_id)
+                    if explicit_id in existing_order_ids:
+                        skipped_existing.append(explicit_id)
+                        continue
+
+                user_id = int(item["user_id"])
+                conn.execute(
+                    "INSERT OR IGNORE INTO user_preferences(user_id, pool_notifications, created_at, updated_at) VALUES(?, 1, ?, ?)",
+                    (user_id, now, now),
+                )
+
+                city_code = str(item["city_code"]).lower()
+                city_name = str(item["city_name"])[:100]
+                status = str(item.get("status") or "pending")
+
+                raw_sid = item.get("shipment_id")
+                actual_sid = None
+                if raw_sid is not None:
+                    raw_sid_int = int(raw_sid)
+                    if raw_sid_int in shipment_id_map:
+                        actual_sid = shipment_id_map[raw_sid_int]
+                    elif raw_sid_int in existing_shipments and existing_shipments[raw_sid_int]["city_name"] == city_name:
+                        actual_sid = raw_sid_int
+
+                if status == "shipped" and actual_sid is None:
+                    status = "accepted"
+
+                in_pool = 1 if (
+                    item.get("in_pool")
+                    and city_code == "vlg"
+                    and actual_sid is None
+                    and status == "accepted"
+                ) else 0
+
+                params = (
+                    user_id,
+                    round(float(item["weight_kg"]), 2),
+                    city_name,
+                    city_code,
+                    float(item.get("price_cny") or 0.0),
+                    float(item.get("goods_rub") or 0.0),
+                    float(item.get("service_fee_rub") or 0.0),
+                    float(item.get("usd_rate") or 0.0),
+                    round(float(item.get("total_rub") or 0.0), 2),
+                    str(item.get("item_desc") or "")[:1500],
+                    status,
+                    str(item["reject_reason"])[:1000] if item.get("reject_reason") else None,
+                    actual_sid,
+                    str(item.get("created_at") or now)[:50],
+                    in_pool,
+                    str(item.get("recipient_name") or "")[:200],
+                    str(item.get("recipient_address") or "")[:500],
+                    str(item.get("recipient_phone") or "")[:100],
+                    str(item.get("delivery_method") or "")[:100],
+                    str(item.get("status_message") or "")[:1000],
+                    str(item["sent_to_client_at"])[:50] if item.get("sent_to_client_at") else None,
+                    str(item["delivered_at"])[:50] if item.get("delivered_at") else None,
+                )
+
+                if explicit_id is not None and explicit_id > 0:
+                    conn.execute(
+                        """
+                        INSERT INTO orders(
+                            order_id, user_id, weight_kg, city_name, city_code, price_cny, goods_rub,
+                            service_fee_rub, usd_rate, total_rub, item_desc, status, reject_reason,
+                            shipment_id, created_at, in_pool, recipient_name, recipient_address,
+                            recipient_phone, delivery_method, status_message, sent_to_client_at, delivered_at
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (explicit_id, *params),
+                    )
+                    new_order_id = explicit_id
+                else:
+                    cur = conn.execute(
+                        """
+                        INSERT INTO orders(
+                            user_id, weight_kg, city_name, city_code, price_cny, goods_rub,
+                            service_fee_rub, usd_rate, total_rub, item_desc, status, reject_reason,
+                            shipment_id, created_at, in_pool, recipient_name, recipient_address,
+                            recipient_phone, delivery_method, status_message, sent_to_client_at, delivered_at
+                        ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        params,
+                    )
+                    new_order_id = int(cur.lastrowid)
+
+                existing_order_ids.add(new_order_id)
+                added_order_ids.append(new_order_id)
+                added_orders += 1
+
+                for tracker in item.get("trackers", []):
+                    clean_tracker = str(tracker).strip()[:200]
+                    if clean_tracker:
+                        conn.execute(
+                            "INSERT OR IGNORE INTO order_trackers(order_id, tracker) VALUES(?, ?)",
+                            (new_order_id, clean_tracker),
+                        )
+
+            self._reset_sequence(conn, "orders", "order_id")
+            self._reset_sequence(conn, "shipments", "id")
+
+        return {
+            "added_orders": added_orders,
+            "added_order_ids": added_order_ids,
+            "skipped_existing": skipped_existing,
+            "added_shipments": added_shipments,
+        }
 
 db = Database()

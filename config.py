@@ -24,6 +24,19 @@ def allowed_delivery_methods(city_code: str) -> set[str]:
 load_dotenv(BASE_DIR / ".env")
 
 
+def normalize_tg_url(raw: str) -> str:
+    value = (raw or "").strip()
+    if not value:
+        return ""
+    if value.startswith(("http://", "https://")):
+        return value
+    if value.startswith("@") and len(value) > 1:
+        return f"https://t.me/{value[1:]}"
+    if value.startswith("t.me/"):
+        return f"https://{value}"
+    return ""
+
+
 def _admin_ids() -> tuple[int, ...]:
     raw = os.getenv("ADMIN_IDS", os.getenv("ADMIN_ID", ""))
     values = []
@@ -54,6 +67,10 @@ class Config:
     target_pool_weight: float = 5.0
     max_price_cny: float = 999_999.0
     max_weight_kg: float = 150.0
+    manager_username: str = os.getenv("MANAGER_USERNAME", "amdfanatik").strip().lstrip("@") or "amdfanatik"
+    work_hours: str = os.getenv("WORK_HOURS", "8:00–22:00 МСК").strip() or "8:00–22:00 МСК"
+    reviews_url: str = normalize_tg_url(os.getenv("REVIEWS_URL", "") or "https://t.me/nerdsdelivoreviews")
+    channel_url: str = normalize_tg_url(os.getenv("CHANNEL_URL", "") or "https://t.me/funkadelips")
 
     def is_admin(self, user_id: int | None) -> bool:
         return user_id is not None and user_id in self.admin_ids

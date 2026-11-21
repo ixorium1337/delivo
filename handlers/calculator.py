@@ -1,15 +1,24 @@
 from aiogram import F, Router
 from aiogram.exceptions import TelegramBadRequest
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, Message, ReplyKeyboardRemove
 
 import texts
 from calculator import PRICE_LIMIT_JOKE, WEIGHT_LIMIT_JOKE, calculate_order
 from config import DELIVERY_METHODS, allowed_delivery_methods, config
 from states import CalculatorStates
-from ui import city_keyboard, delivery_keyboard, main_menu, order_from_calc_keyboard, step_menu
+from ui import city_keyboard, delivery_keyboard, main_menu, order_from_calc_row, step_menu
 
 router = Router()
+
+
+@router.callback_query(F.data == "menu:calc")
+async def start_calculator_callback(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await state.set_state(CalculatorStates.waiting_for_price)
+    if callback.message:
+        await callback.message.answer(texts.CALC_START, reply_markup=step_menu(False))
+    await callback.answer()
 
 
 @router.message(F.text == "🧮 Калькулятор стоимости")
@@ -111,6 +120,13 @@ async def process_delivery(callback: CallbackQuery, state: FSMContext):
             await callback.message.delete()
         except TelegramBadRequest:
             pass
-        await callback.message.answer(texts.calc_result(result), reply_markup=order_from_calc_keyboard())
-        await callback.message.answer("Главное меню:", reply_markup=main_menu(config.is_admin(callback.from_user.id)))
+        # Снимаем reply-клавиатуру шагов и показываем результат с inline-кнопками.
+        await callback.message.answer(texts.calc_result(result), reply_markup=ReplyKeyboardRemove())
+        await callback.message.answer(
+            texts.MAIN_MENU,
+            reply_markup=main_menu(
+                config.is_admin(callback.from_user.id),
+                extra_rows=[order_from_calc_row()],
+            ),
+        )
     await callback.answer()
