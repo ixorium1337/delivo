@@ -20,7 +20,12 @@ class OrderStates(StatesGroup):
     waiting_for_phone = State()
 
 
+class UserEditStates(StatesGroup):
+    waiting_for_value = State()
+
+
 class AdminStates(StatesGroup):
+    waiting_for_edit_value = State()
     waiting_for_excel_import = State()
     waiting_for_excel_confirm = State()
     waiting_for_broker_cny = State()

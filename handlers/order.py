@@ -11,13 +11,28 @@ import texts
 from calculator import PRICE_LIMIT_JOKE, WEIGHT_LIMIT_JOKE, calculate_order
 from config import DELIVERY_METHODS, allowed_delivery_methods, config
 from database import db
-from states import OrderStates
+from notifications import notify_pool_change
+from order_edit import (
+    CLIENT_NOT_EDITABLE,
+    EditError,
+    change_line,
+    clean_phone,
+    clean_text,
+    parse_price,
+    parse_weight,
+    reprice_lines,
+)
+from states import OrderStates, UserEditStates
 from ui import (
+    admin_open_ticket_keyboard,
     city_keyboard,
     delivery_keyboard,
     main_menu,
     manager_ticket_keyboard,
     step_menu,
+    user_edit_cancel_keyboard,
+    user_edit_delivery_keyboard,
+    user_edit_keyboard,
     user_history_keyboard,
     user_ticket_keyboard,
 )
@@ -372,15 +387,24 @@ def _user_ticket_text(order: dict) -> str:
     sent = f"\n• 📤 Отправлен вам: <b>{escape(order['sent_to_client_at'])}</b>" if order.get("sent_to_client_at") else ""
     delivered = f"\n• 📬 Доставлен: <b>{escape(order['delivered_at'])}</b>" if order.get("delivered_at") else ""
     media_count = len(order.get("media", []))
+    editable_hint = (
+        "\n\n<i>✏️ До отправки заказа вы можете изменить его кнопкой «Изменить заказ».</i>"
+        if db.is_client_editable(order) else ""
+    )
     return (
         f"🎫 <b>Тикет #{order['order_id']}</b>\n\n"
         f"• Статус: <b>{status_map.get(order['status'], 'Неизвестный статус')}</b>\n"
         f"• Город: <b>{escape(order['city_name'])}</b>\n"
         f"• Вес: <b>{order['weight_kg']} кг</b>\n"
+        f"• Стоимость товара: <b>{float(order.get('price_cny') or 0):g} ¥</b>\n"
         f"• Сумма: <b>{order['total_rub']:.2f} ₽</b>\n"
         f"• Доставка дальше: <b>{escape(order.get('delivery_method') or 'не указана')}</b>\n"
+        f"• Получатель: <b>{escape(order.get('recipient_name') or 'не указан')}</b>\n"
+        f"• Телефон: <b>{escape(order.get('recipient_phone') or 'не указан')}</b>\n"
+        f"• Адрес: <b>{escape(order.get('recipient_address') or 'не указан')}</b>\n"
+        f"• Детали: {escape(order.get('item_desc') or 'не указаны')}\n"
         f"• Фото в тикете: <b>{media_count}</b>"
-        f"{shipment_text}{arrival}{sent}{delivered}{update}"
+        f"{shipment_text}{arrival}{sent}{delivered}{update}{editable_hint}"
     )
 
 
@@ -396,7 +420,10 @@ async def user_order_view(callback: CallbackQuery):
         await callback.answer("Тикет не найден в вашей истории.", show_alert=True)
         return
     if callback.message:
-        await callback.message.answer(_user_ticket_text(order), reply_markup=user_ticket_keyboard(order_id))
+        await callback.message.answer(
+            _user_ticket_text(order),
+            reply_markup=user_ticket_keyboard(order_id, editable=db.is_client_editable(order)),
+        )
         for media in order.get("media", []):
             label = "Фото товара от клиента" if media.get("source") == "client_item" else "Фото от менеджера"
             note = (media.get("caption") or "").strip()
@@ -419,3 +446,252 @@ async def user_orders_back(callback: CallbackQuery):
             reply_markup=user_history_keyboard(orders) if orders else None,
         )
     await callback.answer()
+
+
+# ---------- Редактирование тикета клиентом (до отправки заказа) ----------
+
+USER_EDIT_PROMPTS = {
+    "link": "🔗 Пришлите <b>ссылку на товар</b>, которую нужно добавить к заказу:",
+    "details": "📝 Напишите, что <b>добавить к деталям</b> заказа (размер, цвет, пожелания):",
+    "photo": "📷 Пришлите <b>фото товара</b> (можно с подписью-пояснением):",
+    "weight": "⚖️ Укажите новый <b>вес в кг</b> (например: 1.2).\nТекущий: <b>{weight_kg} кг</b>",
+    "price": "💴 Укажите новую <b>стоимость товара в юанях (¥)</b>.\nТекущая: <b>{price_cny:g} ¥</b>",
+    "recipient": "👤 Укажите <b>ФИО получателя</b>.\nСейчас: <b>{recipient_name}</b>",
+    "phone": "📞 Укажите <b>номер телефона получателя</b>.\nСейчас: <b>{recipient_phone}</b>",
+    "address": "🏠 Укажите <b>адрес доставки</b> (город, улица, дом/ПВЗ).\nСейчас: <b>{recipient_address}</b>",
+}
+
+
+def _split_callback(data: str | None, prefix: str, parts: int) -> list[str] | None:
+    if not data or not data.startswith(prefix):
+        return None
+    values = data[len(prefix):].split(":")
+    return values if len(values) == parts else None
+
+
+def _user_edit_menu_text(order: dict) -> str:
+    return (
+        f"✏️ <b>Изменение заказа #{order['order_id']}</b>\n\n"
+        "До отправки заказа вы можете добавить ссылки, детали и фото, а также изменить вес, "
+        "стоимость в юанях, способ доставки (последнюю милю), получателя, телефон и адрес.\n\n"
+        "При изменении веса или стоимости итоговая сумма будет пересчитана. "
+        "Менеджер получит уведомление обо всех изменениях.\n\n"
+        "Что изменить?"
+    )
+
+
+async def _notify_admins_client_edit(bot, user, order_id: int, changes: list[str], photo_id: str | None = None) -> None:
+    username = f"@{escape(user.username)}" if user.username else "без username"
+    text = (
+        f"✏️ <b>Клиент изменил тикет #{order_id}</b>\n"
+        f"👤 <code>{user.id}</code> ({username})\n\n" + "\n".join(changes)
+    )
+    markup = admin_open_ticket_keyboard(order_id)
+    for admin_id in config.admin_ids:
+        try:
+            if photo_id:
+                await bot.send_photo(admin_id, photo_id, caption=f"📷 Новое фото клиента к тикету #{order_id}")
+            await bot.send_message(admin_id, text, reply_markup=markup)
+        except Exception as exc:
+            logger.warning("Не удалось уведомить админа %s об изменении тикета #%s: %s", admin_id, order_id, exc)
+
+
+async def _get_editable_order(user_id: int, order_id: int) -> tuple[dict | None, str | None]:
+    order = db.get_user_order(user_id, order_id)
+    if not order:
+        return None, "Тикет не найден в вашей истории."
+    if not db.is_client_editable(order):
+        return None, CLIENT_NOT_EDITABLE
+    return order, None
+
+
+@router.callback_query(F.data.startswith("user_edit:"))
+async def user_edit_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    parts = _split_callback(callback.data, "user_edit:", 1)
+    try:
+        order_id = int(parts[0]) if parts else 0
+    except ValueError:
+        order_id = 0
+    order, error = await _get_editable_order(callback.from_user.id, order_id)
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+    if callback.message:
+        await callback.message.answer(_user_edit_menu_text(order), reply_markup=user_edit_keyboard(order_id))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("user_edit_f:"))
+async def user_edit_field(callback: CallbackQuery, state: FSMContext):
+    parts = _split_callback(callback.data, "user_edit_f:", 2)
+    if not parts or (parts[1] not in USER_EDIT_PROMPTS and parts[1] != "delivery"):
+        await callback.answer("Некорректная команда.", show_alert=True)
+        return
+    try:
+        order_id = int(parts[0])
+    except ValueError:
+        await callback.answer("Некорректный тикет.", show_alert=True)
+        return
+    field = parts[1]
+    order, error = await _get_editable_order(callback.from_user.id, order_id)
+    if error:
+        await state.clear()
+        await callback.answer(error, show_alert=True)
+        return
+    if not callback.message:
+        await callback.answer()
+        return
+    if field == "delivery":
+        await state.clear()
+        await callback.message.answer(
+            f"🚚 Выберите способ доставки из <b>{escape(order['city_name'])}</b> до вашего адреса.\n"
+            f"Сейчас: <b>{escape(order.get('delivery_method') or 'не указана')}</b>\n\n"
+            "⚠️ Эта доставка оплачивается отдельно.",
+            reply_markup=user_edit_delivery_keyboard(order_id, order["city_code"], order.get("delivery_method") or ""),
+        )
+        await callback.answer()
+        return
+    await state.set_state(UserEditStates.waiting_for_value)
+    await state.update_data(edit_order_id=order_id, edit_field=field)
+    values = {
+        "weight_kg": order["weight_kg"],
+        "price_cny": float(order.get("price_cny") or 0),
+        "recipient_name": escape(order.get("recipient_name") or "не указан"),
+        "recipient_phone": escape(order.get("recipient_phone") or "не указан"),
+        "recipient_address": escape(order.get("recipient_address") or "не указан"),
+    }
+    await callback.message.answer(
+        USER_EDIT_PROMPTS[field].format(**values),
+        reply_markup=user_edit_cancel_keyboard(order_id),
+    )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("user_edit_dlv:"))
+async def user_edit_delivery(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    parts = _split_callback(callback.data, "user_edit_dlv:", 2)
+    try:
+        order_id = int(parts[0]) if parts else 0
+    except ValueError:
+        order_id = 0
+    order, error = await _get_editable_order(callback.from_user.id, order_id)
+    if error:
+        await callback.answer(error, show_alert=True)
+        return
+    code = parts[1]
+    if code not in allowed_delivery_methods(order["city_code"]):
+        await callback.answer("Этот способ доставки недоступен для вашего города прибытия.", show_alert=True)
+        return
+    new_method = DELIVERY_METHODS[code]
+    if new_method == order.get("delivery_method"):
+        await callback.answer("Этот способ доставки уже выбран.")
+        return
+    old = db.update_order_text_field(order_id, "delivery_method", new_method, user_id=callback.from_user.id)
+    if not old:
+        await callback.answer(CLIENT_NOT_EDITABLE, show_alert=True)
+        return
+    changes = [change_line("Последняя миля", old.get("delivery_method"), new_method)]
+    await _notify_admins_client_edit(callback.bot, callback.from_user, order_id, changes)
+    if callback.message:
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            pass
+        await callback.message.answer(
+            "✅ <b>Изменения сохранены</b>\n\n" + "\n".join(changes) + "\n\nМенеджер уведомлён. Изменить что-то ещё?",
+            reply_markup=user_edit_keyboard(order_id),
+        )
+    await callback.answer("Сохранено")
+
+
+async def _apply_user_edit(message: Message, order: dict, field: str) -> tuple[list[str], str | None] | None:
+    """Применяет изменение. Возвращает (строки изменений, file_id фото) или None, если тикет стал недоступен."""
+    user_id = message.from_user.id
+    order_id = int(order["order_id"])
+    if field == "photo":
+        if not message.photo:
+            raise EditError("Пришлите именно фотографию (не файлом).")
+        caption = (message.caption or "").strip()
+        if len(caption) > 900:
+            raise EditError("Подпись слишком длинная — до 900 символов.")
+        photo = message.photo[-1]
+        db.add_media(order_id, photo.file_id, photo.file_unique_id, "client_item", user_id, caption)
+        line = "• Добавлено фото товара" + (f": {escape(caption)}" if caption else "")
+        return [line], photo.file_id
+
+    if field in {"link", "details"}:
+        if field == "link":
+            value = clean_text(message.text, "Ссылка", 500)
+            addition = f"🔗 {value}"
+        else:
+            value = clean_text(message.text, "Детали", 1000)
+            addition = f"📝 {value}"
+        try:
+            result = db.append_item_desc(order_id, addition, user_id=user_id)
+        except ValueError as exc:
+            raise EditError(str(exc)) from exc
+        if not result:
+            return None
+        label = "Добавлена ссылка" if field == "link" else "Добавлены детали"
+        return [f"• {label}: <b>{escape(value)}</b>"], None
+
+    if field in {"weight", "price"}:
+        if field == "weight":
+            weight = parse_weight(message.text)
+            if order["city_code"] == "msk" and weight < 5.0:
+                raise EditError("В Москву отправка только от 5 кг. Для меньшего веса напишите менеджеру.")
+            kwargs = {"weight_kg": weight}
+        else:
+            kwargs = {"price_cny": parse_price(message.text)}
+        pool_before = db.pool_info()
+        result = db.reprice_order(order_id, user_id=user_id, **kwargs)
+        if not result:
+            return None
+        pool_after = db.pool_info()
+        await notify_pool_change(message.bot, pool_before, pool_after, "Клиент изменил вес тикета в пуле.", {user_id})
+        lines = reprice_lines(result) or ["• Значение не изменилось"]
+        return lines, None
+
+    text_fields = {
+        "recipient": ("recipient_name", "Получатель", lambda raw: clean_text(raw, "ФИО", 200)),
+        "phone": ("recipient_phone", "Телефон", clean_phone),
+        "address": ("recipient_address", "Адрес", lambda raw: clean_text(raw, "Адрес", 500)),
+    }
+    column, label, validator = text_fields[field]
+    value = validator(message.text)
+    old = db.update_order_text_field(order_id, column, value, user_id=user_id)
+    if not old:
+        return None
+    return [change_line(label, old.get(column), value)], None
+
+
+@router.message(UserEditStates.waiting_for_value)
+async def user_edit_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = data.get("edit_order_id")
+    field = data.get("edit_field")
+    order, error = await _get_editable_order(message.from_user.id, int(order_id or 0))
+    if error or field not in USER_EDIT_PROMPTS:
+        await state.clear()
+        await message.answer(error or "Данные редактирования устарели. Откройте тикет заново.")
+        return
+    try:
+        result = await _apply_user_edit(message, order, field)
+    except EditError as exc:
+        await message.answer(f"❌ {escape(str(exc))}", reply_markup=user_edit_cancel_keyboard(order_id))
+        return
+    except ValueError as exc:
+        await message.answer(f"❌ Не удалось сохранить: {escape(str(exc))}", reply_markup=user_edit_cancel_keyboard(order_id))
+        return
+    await state.clear()
+    if result is None:
+        await message.answer(CLIENT_NOT_EDITABLE)
+        return
+    changes, photo_id = result
+    await _notify_admins_client_edit(message.bot, message.from_user, order_id, changes, photo_id)
+    await message.answer(
+        "✅ <b>Изменения сохранены</b>\n\n" + "\n".join(changes) + "\n\nМенеджер уведомлён. Изменить что-то ещё?",
+        reply_markup=user_edit_keyboard(order_id),
+    )

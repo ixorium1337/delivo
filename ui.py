@@ -1,6 +1,6 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
-from config import config
+from config import DELIVERY_METHODS, config
 
 HOME_TEXT = "⬅️ Назад в меню"
 
@@ -76,7 +76,7 @@ def city_keyboard(weight_kg: float = 5.0) -> InlineKeyboardMarkup:
 
 
 
-def delivery_keyboard(city_code: str) -> InlineKeyboardMarkup:
+def delivery_methods_for_city(city_code: str) -> list[tuple[str, str]]:
     methods = [
         ("📦 СДЭК", "cdek"),
         ("📦 Boxberry", "boxberry"),
@@ -85,10 +85,29 @@ def delivery_keyboard(city_code: str) -> InlineKeyboardMarkup:
     ]
     if city_code == "vlg":
         methods.extend([("🛍 Авито", "avito"), ("🟣 OZON", "ozon")])
+    return methods
+
+
+def delivery_keyboard(city_code: str) -> InlineKeyboardMarkup:
+    methods = delivery_methods_for_city(city_code)
     rows = []
     for i in range(0, len(methods), 2):
         rows.append([InlineKeyboardButton(text=label, callback_data=f"delivery:{code}") for label, code in methods[i:i + 2]])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _edit_delivery_rows(city_code: str, current: str, prefix: str) -> list[list[InlineKeyboardButton]]:
+    methods = delivery_methods_for_city(city_code)
+    rows = []
+    for i in range(0, len(methods), 2):
+        rows.append([
+            InlineKeyboardButton(
+                text=("✅ " if DELIVERY_METHODS.get(code) == current else "") + label,
+                callback_data=f"{prefix}:{code}",
+            )
+            for label, code in methods[i:i + 2]
+        ])
+    return rows
 
 
 def order_from_calc_row() -> list[InlineKeyboardButton]:
@@ -105,11 +124,102 @@ def user_history_keyboard(orders: list[dict] | None = None) -> InlineKeyboardMar
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
-def user_ticket_keyboard(order_id: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
+def user_ticket_keyboard(order_id: int, editable: bool = False) -> InlineKeyboardMarkup:
+    rows = []
+    if editable:
+        rows.append([InlineKeyboardButton(text="✏️ Изменить заказ", callback_data=f"user_edit:{order_id}")])
+    rows.extend([
         [InlineKeyboardButton(text="⬅️ К истории заказов", callback_data="user_orders_back")],
         [home_button()],
     ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def user_edit_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    def b(text: str, field: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(text=text, callback_data=f"user_edit_f:{order_id}:{field}")
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [b("🔗 Добавить ссылку", "link"), b("📝 Добавить детали", "details")],
+        [b("📷 Добавить фото", "photo")],
+        [b("🚚 Последняя миля", "delivery"), b("🏠 Адрес", "address")],
+        [b("⚖️ Вес", "weight"), b("💴 Стоимость в ¥", "price")],
+        [b("👤 Получатель", "recipient"), b("📞 Телефон", "phone")],
+        [InlineKeyboardButton(text="⬅️ К тикету", callback_data=f"user_order_view:{order_id}")],
+    ])
+
+
+def user_edit_delivery_keyboard(order_id: int, city_code: str, current: str) -> InlineKeyboardMarkup:
+    rows = _edit_delivery_rows(city_code, current, f"user_edit_dlv:{order_id}")
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"user_edit:{order_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def user_edit_cancel_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="❌ Отмена", callback_data=f"user_edit:{order_id}")
+    ]])
+
+
+def admin_open_ticket_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=f"🎫 Открыть тикет #{order_id}", callback_data=f"adm_order_view:{order_id}")
+    ]])
+
+
+def admin_edit_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    def b(text: str, field: str) -> InlineKeyboardButton:
+        return InlineKeyboardButton(text=text, callback_data=f"adm_ef:{order_id}:{field}")
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [b("🏙 Город прибытия", "city"), b("🚚 Последняя миля", "delivery")],
+        [b("👤 Получатель", "recipient"), b("📞 Телефон", "phone")],
+        [b("🏠 Адрес", "address")],
+        [b("⚖️ Вес", "weight"), b("💴 Стоимость в ¥", "price")],
+        [b("💰 Итоговая сумма (вручную)", "total")],
+        [b("📝 Заменить детали/ссылки", "desc"), b("➕ Дописать к деталям", "desc_add")],
+        [
+            InlineKeyboardButton(text="📍 Добавить трекер", callback_data=f"adm_add_track:{order_id}"),
+            b("➖ Удалить трекер", "rmtrack"),
+        ],
+        [
+            InlineKeyboardButton(text="📷 Добавить фото", callback_data=f"adm_media_add:{order_id}"),
+            InlineKeyboardButton(text="🖼 Вложения", callback_data=f"adm_media_list:{order_id}"),
+        ],
+        [InlineKeyboardButton(text="⬅️ К тикету", callback_data=f"adm_order_view:{order_id}")],
+    ])
+
+
+def admin_edit_city_keyboard(order_id: int, current: str) -> InlineKeyboardMarkup:
+    cities = [("🏢 Москва", "msk"), ("🏙 Волгоград", "vlg")]
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=("✅ " if code == current else "") + label, callback_data=f"adm_ecity:{order_id}:{code}")
+            for label, code in cities
+        ],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm_edit:{order_id}")],
+    ])
+
+
+def admin_edit_delivery_keyboard(order_id: int, city_code: str, current: str) -> InlineKeyboardMarkup:
+    rows = _edit_delivery_rows(city_code, current, f"adm_edlv:{order_id}")
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm_edit:{order_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_edit_trackers_keyboard(order_id: int, trackers: list[str]) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text=f"🗑 {tracker[:40]}", callback_data=f"adm_ermtr:{order_id}:{idx}")]
+        for idx, tracker in enumerate(trackers[:20])
+    ]
+    rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data=f"adm_edit:{order_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def admin_edit_cancel_keyboard(order_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Отмена", callback_data=f"adm_edit:{order_id}")
+    ]])
 
 
 def user_ticket_notice_keyboard(order_id: int) -> InlineKeyboardMarkup:
@@ -270,8 +380,8 @@ def admin_search_results_keyboard(orders: list[dict]) -> InlineKeyboardMarkup:
 
 def admin_order_card_keyboard(order_id: int, order: dict | None = None) -> InlineKeyboardMarkup:
     order = order or {}
-    buttons = []
-    if order.get("status") in {"accepted", "shipped"}:
+    buttons = [[InlineKeyboardButton(text="✏️ Редактировать тикет", callback_data=f"adm_edit:{order_id}")]]
+    if order.get("status") in {"pending", "accepted", "shipped"}:
         buttons.append([InlineKeyboardButton(text="📷 Прикрепить фото + пояснение", callback_data=f"adm_media_add:{order_id}")])
     media_count = len(order.get("media", []))
     if media_count:

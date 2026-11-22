@@ -554,6 +554,163 @@ class Database:
             conn.execute("UPDATE orders SET weight_kg=?, total_rub=? WHERE order_id=?", (round(new_weight, 2), total, int(order_id)))
             return old_weight, round(new_weight, 2), total
 
+    # ---------- Редактирование тикета ----------
+
+    CLIENT_EDITABLE_STATUSES = frozenset({"pending", "accepted"})
+    ORDER_TEXT_LIMITS = {
+        "recipient_name": 200,
+        "recipient_address": 500,
+        "recipient_phone": 100,
+        "delivery_method": 100,
+        "item_desc": 1500,
+    }
+    # Клиент может менять тикет, пока заказ не отправлен из Китая: тикет ожидает
+    # подтверждения или принят и (если уже в отправлении) отправление ещё формируется.
+    _CLIENT_EDIT_SQL = (
+        "status IN ('pending', 'accepted') AND (shipment_id IS NULL OR EXISTS("
+        "SELECT 1 FROM shipments s WHERE s.id=orders.shipment_id AND s.status='forming'))"
+    )
+    CITY_NAMES = {"msk": "Москва", "vlg": "Волгоград"}
+
+    @classmethod
+    def is_client_editable(cls, order: dict | None) -> bool:
+        if not order or order.get("status") not in cls.CLIENT_EDITABLE_STATUSES:
+            return False
+        shipment = order.get("shipment")
+        if order.get("shipment_id") and (not shipment or shipment.get("status") != "forming"):
+            return False
+        return True
+
+    def _edit_where(self, order_id: int, user_id: int | None) -> tuple[str, list]:
+        where = "order_id=?"
+        params: list = [int(order_id)]
+        if user_id is not None:
+            where += f" AND user_id=? AND {self._CLIENT_EDIT_SQL}"
+            params.append(int(user_id))
+        return where, params
+
+    def update_order_text_field(self, order_id: int, field: str, value: str, user_id: int | None = None) -> dict | None:
+        """Меняет текстовое поле тикета. Если передан user_id — только для редактируемого клиентом тикета.
+
+        Возвращает тикет до изменения или None, если тикет не найден/недоступен.
+        """
+        limit = self.ORDER_TEXT_LIMITS.get(field)
+        if limit is None:
+            raise ValueError("Это поле нельзя изменить")
+        value = str(value or "").strip()[:limit]
+        where, params = self._edit_where(order_id, user_id)
+        with self._connect() as conn:
+            old = conn.execute(f"SELECT * FROM orders WHERE {where}", params).fetchone()
+            if not old:
+                return None
+            cur = conn.execute(f"UPDATE orders SET {field}=? WHERE {where}", [value, *params])
+            return dict(old) if cur.rowcount == 1 else None
+
+    def append_item_desc(self, order_id: int, addition: str, user_id: int | None = None) -> tuple[str, str] | None:
+        """Дописывает строку к описанию/деталям тикета. Возвращает (старое, новое) описание."""
+        addition = str(addition or "").strip()
+        if not addition:
+            raise ValueError("Пустое дополнение")
+        where, params = self._edit_where(order_id, user_id)
+        with self._connect() as conn:
+            row = conn.execute(f"SELECT item_desc FROM orders WHERE {where}", params).fetchone()
+            if not row:
+                return None
+            old = str(row["item_desc"] or "").strip()
+            new = f"{old}\n{addition}" if old else addition
+            limit = self.ORDER_TEXT_LIMITS["item_desc"]
+            if len(new) > limit:
+                raise ValueError(
+                    f"Описание заказа не может превышать {limit} символов "
+                    f"(свободно: {max(0, limit - len(old) - 1)}). Сократите текст или напишите менеджеру."
+                )
+            cur = conn.execute(f"UPDATE orders SET item_desc=? WHERE {where}", [new, *params])
+            return (old, new) if cur.rowcount == 1 else None
+
+    def reprice_order(
+        self,
+        order_id: int,
+        *,
+        price_cny: float | None = None,
+        weight_kg: float | None = None,
+        city_code: str | None = None,
+        user_id: int | None = None,
+    ) -> dict | None:
+        """Меняет стоимость в ¥ / вес / город и пересчитывает итоговую сумму.
+
+        Товар при смене цены пересчитывается по текущему курсу CNY (с учётом порога 5 000 ₽),
+        доставка — по курсу USD, зафиксированному в заказе. Возвращает {"old": ..., "new": ...}.
+        """
+        if weight_kg is not None and not 0 < float(weight_kg) <= config.max_weight_kg:
+            raise ValueError("Некорректный вес")
+        if price_cny is not None and not 0 < float(price_cny) <= config.max_price_cny:
+            raise ValueError("Некорректная стоимость")
+        if city_code is not None and city_code not in self.CITY_NAMES:
+            raise ValueError("Некорректный город")
+        rates = self.get_rates()
+        where, params = self._edit_where(order_id, user_id)
+        with self._connect() as conn:
+            row = conn.execute(f"SELECT * FROM orders WHERE {where}", params).fetchone()
+            if not row:
+                return None
+            old = dict(row)
+            new_city = city_code or old["city_code"]
+            if new_city != old["city_code"] and old["shipment_id"] is not None:
+                raise ValueError("Тикет уже находится в отправлении — город изменить нельзя. Сначала уберите его из отправления.")
+            new_weight = round(float(weight_kg if weight_kg is not None else old["weight_kg"]), 2)
+            old_price = float(old["price_cny"] or 0)
+            new_price = round(float(price_cny), 2) if price_cny is not None else old_price
+            if price_cny is None or abs(new_price - old_price) < 1e-9:
+                goods_rub = float(old["goods_rub"] or 0)
+                service_fee = float(old["service_fee_rub"] or 0)
+            else:
+                cny_rate = rates["cny_high"] if new_price * rates["cny_low"] >= 5000.0 else rates["cny_low"]
+                goods_rub = round(new_price * cny_rate, 2)
+                service_fee = round(max(config.service_fee_min_rub, goods_rub * config.service_fee_percent), 2)
+            usd_rate = float(old["usd_rate"] or 0) or rates["usd"]
+            rate_usd_kg = config.delivery_msk_usd_kg if new_city == "msk" else config.delivery_vlg_usd_kg
+            delivery_rub = round(round(new_weight * rate_usd_kg, 2) * usd_rate, 2)
+            total = round(goods_rub + service_fee + delivery_rub, 2)
+            in_pool = int(old["in_pool"] or 0)
+            if new_city != old["city_code"] and old["status"] == "accepted" and old["shipment_id"] is None:
+                in_pool = 1 if new_city == "vlg" else 0
+            new = {
+                "city_code": new_city,
+                "city_name": self.CITY_NAMES[new_city] if new_city != old["city_code"] else old["city_name"],
+                "weight_kg": new_weight,
+                "price_cny": new_price,
+                "goods_rub": goods_rub,
+                "service_fee_rub": service_fee,
+                "usd_rate": usd_rate,
+                "total_rub": total,
+                "in_pool": in_pool,
+            }
+            cur = conn.execute(
+                f"""
+                UPDATE orders SET city_code=?, city_name=?, weight_kg=?, price_cny=?, goods_rub=?,
+                    service_fee_rub=?, usd_rate=?, total_rub=?, in_pool=?
+                WHERE {where}
+                """,
+                [
+                    new["city_code"], new["city_name"], new["weight_kg"], new["price_cny"], new["goods_rub"],
+                    new["service_fee_rub"], new["usd_rate"], new["total_rub"], new["in_pool"], *params,
+                ],
+            )
+            if cur.rowcount != 1:
+                return None
+            return {"old": old, "new": new}
+
+    def set_total_rub(self, order_id: int, total_rub: float) -> float | None:
+        """Ручная установка итоговой суммы менеджером. Возвращает старую сумму."""
+        if not 0 <= float(total_rub) <= 100_000_000:
+            raise ValueError("Некорректная сумма")
+        with self._connect() as conn:
+            row = conn.execute("SELECT total_rub FROM orders WHERE order_id=?", (int(order_id),)).fetchone()
+            if not row:
+                return None
+            conn.execute("UPDATE orders SET total_rub=? WHERE order_id=?", (round(float(total_rub), 2), int(order_id)))
+            return float(row["total_rub"])
+
     def add_tracker(self, order_id: int, tracker: str) -> bool:
         tracker = tracker.strip()[:200]
         if not tracker:

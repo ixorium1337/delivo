@@ -11,7 +11,7 @@ from aiogram.filters import Command, StateFilter
 from excel_io import export_database_to_excel, parse_orders_excel
 
 import texts
-from config import config
+from config import DELIVERY_METHODS, allowed_delivery_methods, config
 from database import db
 from middleware import AdminFilter
 from notifications import (
@@ -20,10 +20,26 @@ from notifications import (
     notify_rate_change,
     sync_admin_order_notification_buttons,
 )
+from order_edit import (
+    EditError,
+    change_line,
+    clean_phone,
+    clean_text,
+    fmt_rub,
+    parse_price,
+    parse_total,
+    parse_weight,
+    reprice_lines,
+)
 from states import AdminStates
 from ui import (
     accepted_db_keyboard,
     admin_cancel_keyboard,
+    admin_edit_cancel_keyboard,
+    admin_edit_city_keyboard,
+    admin_edit_delivery_keyboard,
+    admin_edit_keyboard,
+    admin_edit_trackers_keyboard,
     admin_excel_confirm_keyboard,  
     admin_excel_keyboard,         
     admin_keyboard,
@@ -94,6 +110,7 @@ def _order_card(order: dict) -> str:
         f"• Телефон: <b>{escape(order.get('recipient_phone') or 'не указан')}</b>\n"
         f"• Адрес: <b>{escape(order.get('recipient_address') or 'не указан')}</b>\n"
         f"• Вес: <b>{order['weight_kg']} кг</b>\n"
+        f"• Стоимость товара: <b>{float(order.get('price_cny') or 0):g} ¥</b> ({float(order.get('goods_rub') or 0):.2f} ₽)\n"
         f"• Сумма: <b>{order['total_rub']:.2f} ₽</b>\n"
         f"• Трекеры товара: <code>{escape(trackers)}</code>\n"
         f"• Фото/медиа: <b>{len(order.get('media', []))}</b>\n"
@@ -1005,8 +1022,8 @@ async def media_add_start(callback: CallbackQuery, state: FSMContext):
     if not order:
         await callback.answer("Тикет не найден.", show_alert=True)
         return
-    if order["status"] not in {"accepted", "shipped"}:
-        await callback.answer("Фото можно прикрепить только к принятому или отправленному тикету.", show_alert=True)
+    if order["status"] not in {"pending", "accepted", "shipped"}:
+        await callback.answer("Фото нельзя прикрепить к отменённому или уже доставленному тикету.", show_alert=True)
         return
     await state.update_data(media_order_id=order_id)
     await state.set_state(AdminStates.waiting_for_ticket_photo)
@@ -1027,7 +1044,7 @@ async def media_add_receive(message: Message, state: FSMContext):
     data = await state.get_data()
     order_id = data.get("media_order_id")
     order = db.get_order(order_id) if order_id else None
-    if not order or order["status"] not in {"accepted", "shipped"}:
+    if not order or order["status"] not in {"pending", "accepted", "shipped"}:
         await state.clear()
         await message.answer("Тикет уже недоступен для добавления фото.")
         return
@@ -1058,7 +1075,7 @@ async def media_add_caption_receive(message: Message, state: FSMContext):
     order = db.get_order(order_id) if order_id else None
     file_id = data.get("media_photo_id")
     file_unique_id = data.get("media_photo_unique_id")
-    if not order or order["status"] not in {"accepted", "shipped"} or not file_id or not file_unique_id:
+    if not order or order["status"] not in {"pending", "accepted", "shipped"} or not file_id or not file_unique_id:
         await state.clear()
         await message.answer("Не удалось завершить прикрепление: тикет или фото больше недоступны.")
         return
@@ -1834,3 +1851,283 @@ async def admin_excel_cancel(callback: CallbackQuery, state: FSMContext):
     if callback.message:
         await callback.message.edit_text(_excel_menu_text(), reply_markup=admin_excel_keyboard())
     await callback.answer("Импорт отменён")
+
+
+
+# ---------- Редактирование тикета менеджером (любые поля) ----------
+
+ADMIN_EDIT_PROMPTS = {
+    "recipient": ("👤 Введите новое <b>ФИО получателя</b>.", "recipient_name"),
+    "phone": ("📞 Введите новый <b>телефон получателя</b>.", "recipient_phone"),
+    "address": ("🏠 Введите новый <b>адрес доставки</b>.", "recipient_address"),
+    "weight": ("⚖️ Введите новый <b>вес в кг</b>. Сумма будет пересчитана.", "weight_kg"),
+    "price": ("💴 Введите новую <b>стоимость товара в ¥</b>. Сумма будет пересчитана по текущему курсу CNY.", "price_cny"),
+    "total": ("💰 Введите <b>итоговую сумму в ₽</b> вручную (перезапишет расчёт).", "total_rub"),
+    "desc": ("📝 Введите <b>новый текст деталей/ссылок</b> целиком (до 1500 символов). Старый текст будет заменён.", "item_desc"),
+    "desc_add": ("➕ Введите текст, который нужно <b>дописать</b> к деталям/ссылкам.", "item_desc"),
+}
+
+
+def _split_admin_callback(data: str | None, prefix: str, parts: int) -> list[str] | None:
+    if not data or not data.startswith(prefix):
+        return None
+    values = data[len(prefix):].split(":")
+    if len(values) != parts:
+        return None
+    try:
+        int(values[0])
+    except ValueError:
+        return None
+    return values
+
+
+async def _notify_client_admin_edit(bot, order: dict, changes: list[str]) -> bool:
+    return await _notify(
+        bot,
+        order["user_id"],
+        f"✏️ <b>Менеджер изменил ваш тикет #{order['order_id']}</b>\n\n" + "\n".join(changes),
+        reply_markup=user_ticket_notice_keyboard(order["order_id"]),
+    )
+
+
+async def _send_admin_edit_result(target: Message, order_id: int, changes: list[str], notified: bool) -> None:
+    order = db.get_order(order_id)
+    if not order:
+        await target.answer("Тикет не найден.")
+        return
+    notice = "Клиент уведомлён." if notified else "Не удалось уведомить клиента."
+    await target.answer(
+        "✅ <b>Тикет обновлён</b>\n\n" + "\n".join(changes) + f"\n\n<i>{notice}</i>\n\n" + _order_card(order),
+        reply_markup=admin_edit_keyboard(order_id),
+    )
+
+
+@router.callback_query(F.data.startswith("adm_edit:"))
+async def admin_edit_menu(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    order_id = _callback_id(callback.data, "adm_edit:")
+    order = db.get_order(order_id) if order_id else None
+    if not order:
+        await callback.answer("Тикет не найден.", show_alert=True)
+        return
+    if callback.message:
+        await callback.message.answer(
+            _order_card(order) + "\n\n✏️ <b>Редактирование тикета.</b> Выберите, что изменить. "
+            "Клиент получит уведомление о каждом изменении.",
+            reply_markup=admin_edit_keyboard(order_id),
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_ef:"))
+async def admin_edit_field(callback: CallbackQuery, state: FSMContext):
+    parts = _split_admin_callback(callback.data, "adm_ef:", 2)
+    if not parts:
+        await callback.answer("Некорректная команда.", show_alert=True)
+        return
+    order_id, field = int(parts[0]), parts[1]
+    order = db.get_order(order_id)
+    if not order:
+        await callback.answer("Тикет не найден.", show_alert=True)
+        return
+    if not callback.message:
+        await callback.answer()
+        return
+    if field == "city":
+        await state.clear()
+        await callback.message.answer(
+            f"🏙 Город прибытия тикета #{order_id}: <b>{escape(order['city_name'])}</b>.\n"
+            "При смене города доставка будет пересчитана по тарифу нового города.",
+            reply_markup=admin_edit_city_keyboard(order_id, order["city_code"]),
+        )
+    elif field == "delivery":
+        await state.clear()
+        await callback.message.answer(
+            f"🚚 Последняя миля тикета #{order_id}: <b>{escape(order.get('delivery_method') or 'не указана')}</b>.\nВыберите новую:",
+            reply_markup=admin_edit_delivery_keyboard(order_id, order["city_code"], order.get("delivery_method") or ""),
+        )
+    elif field == "rmtrack":
+        await state.clear()
+        trackers = order.get("trackers", [])
+        if not trackers:
+            await callback.answer("У тикета нет трекеров.", show_alert=True)
+            return
+        await callback.message.answer(
+            f"➖ Выберите трекер для удаления из тикета #{order_id}:",
+            reply_markup=admin_edit_trackers_keyboard(order_id, trackers),
+        )
+    elif field in ADMIN_EDIT_PROMPTS:
+        prompt, column = ADMIN_EDIT_PROMPTS[field]
+        current = order.get(column)
+        current_text = "" if field == "desc_add" else f"\n\nСейчас: <code>{escape(str(current if current not in (None, '') else '—'))}</code>"
+        await state.set_state(AdminStates.waiting_for_edit_value)
+        await state.update_data(adm_edit_order_id=order_id, adm_edit_field=field)
+        await callback.message.answer(prompt + current_text, reply_markup=admin_edit_cancel_keyboard(order_id))
+    else:
+        await callback.answer("Неизвестное поле.", show_alert=True)
+        return
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("adm_ecity:"))
+async def admin_edit_city(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    parts = _split_admin_callback(callback.data, "adm_ecity:", 2)
+    if not parts or parts[1] not in db.CITY_NAMES:
+        await callback.answer("Некорректная команда.", show_alert=True)
+        return
+    order_id, city_code = int(parts[0]), parts[1]
+    order = db.get_order(order_id)
+    if not order:
+        await callback.answer("Тикет не найден.", show_alert=True)
+        return
+    if order["city_code"] == city_code:
+        await callback.answer("Этот город уже выбран.")
+        return
+    method = order.get("delivery_method") or ""
+    allowed_names = {DELIVERY_METHODS[code] for code in allowed_delivery_methods(city_code)}
+    if method and method not in allowed_names:
+        await callback.answer(
+            f"«{method}» недоступна для города {db.CITY_NAMES[city_code]}. Сначала смените последнюю милю.",
+            show_alert=True,
+        )
+        return
+    pool_before = db.pool_info()
+    try:
+        result = db.reprice_order(order_id, city_code=city_code)
+    except ValueError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    if not result:
+        await callback.answer("Тикет не найден.", show_alert=True)
+        return
+    await notify_pool_change(callback.bot, pool_before, db.pool_info(), "Менеджер изменил город прибытия тикета.")
+    changes = reprice_lines(result)
+    notified = await _notify_client_admin_edit(callback.bot, order, changes)
+    if callback.message:
+        await _send_admin_edit_result(callback.message, order_id, changes, notified)
+    await callback.answer("Город изменён")
+
+
+@router.callback_query(F.data.startswith("adm_edlv:"))
+async def admin_edit_delivery(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    parts = _split_admin_callback(callback.data, "adm_edlv:", 2)
+    if not parts or parts[1] not in DELIVERY_METHODS:
+        await callback.answer("Некорректная команда.", show_alert=True)
+        return
+    order_id, code = int(parts[0]), parts[1]
+    order = db.get_order(order_id)
+    if not order:
+        await callback.answer("Тикет не найден.", show_alert=True)
+        return
+    if code not in allowed_delivery_methods(order["city_code"]):
+        await callback.answer("Этот способ недоступен для города прибытия тикета.", show_alert=True)
+        return
+    new_method = DELIVERY_METHODS[code]
+    if new_method == order.get("delivery_method"):
+        await callback.answer("Этот способ уже выбран.")
+        return
+    old = db.update_order_text_field(order_id, "delivery_method", new_method)
+    if not old:
+        await callback.answer("Тикет не найден.", show_alert=True)
+        return
+    changes = [change_line("Последняя миля", old.get("delivery_method"), new_method)]
+    notified = await _notify_client_admin_edit(callback.bot, order, changes)
+    if callback.message:
+        await _send_admin_edit_result(callback.message, order_id, changes, notified)
+    await callback.answer("Сохранено")
+
+
+@router.callback_query(F.data.startswith("adm_ermtr:"))
+async def admin_edit_remove_tracker(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    parts = _split_admin_callback(callback.data, "adm_ermtr:", 2)
+    try:
+        idx = int(parts[1]) if parts else -1
+    except ValueError:
+        idx = -1
+    order_id = int(parts[0]) if parts else 0
+    order = db.get_order(order_id) if order_id else None
+    if not order:
+        await callback.answer("Тикет не найден.", show_alert=True)
+        return
+    trackers = order.get("trackers", [])
+    if not 0 <= idx < len(trackers):
+        await callback.answer("Список трекеров изменился. Откройте его заново.", show_alert=True)
+        return
+    tracker = trackers[idx]
+    if not db.remove_tracker(order_id, tracker):
+        await callback.answer("Трекер уже удалён.", show_alert=True)
+        return
+    changes = [f"• Удалён трек-номер: <code>{escape(tracker)}</code>"]
+    notified = await _notify_client_admin_edit(callback.bot, order, changes)
+    if callback.message:
+        await _send_admin_edit_result(callback.message, order_id, changes, notified)
+    await callback.answer("Трекер удалён")
+
+
+@router.message(AdminStates.waiting_for_edit_value)
+async def admin_edit_value(message: Message, state: FSMContext):
+    data = await state.get_data()
+    order_id = int(data.get("adm_edit_order_id") or 0)
+    field = data.get("adm_edit_field")
+    order = db.get_order(order_id) if order_id else None
+    if not order or field not in ADMIN_EDIT_PROMPTS:
+        await state.clear()
+        await message.answer("Тикет не найден или данные редактирования устарели.")
+        return
+    try:
+        changes = await _apply_admin_edit(message, order, field)
+    except (EditError, ValueError) as exc:
+        await message.answer(f"❌ {escape(str(exc))}", reply_markup=admin_edit_cancel_keyboard(order_id))
+        return
+    await state.clear()
+    if changes is None:
+        await message.answer("Тикет не найден.")
+        return
+    notified = await _notify_client_admin_edit(message.bot, order, changes)
+    await _send_admin_edit_result(message, order_id, changes, notified)
+
+
+async def _apply_admin_edit(message: Message, order: dict, field: str) -> list[str] | None:
+    order_id = int(order["order_id"])
+    if field in {"weight", "price"}:
+        kwargs = {"weight_kg": parse_weight(message.text)} if field == "weight" else {"price_cny": parse_price(message.text)}
+        pool_before = db.pool_info()
+        result = db.reprice_order(order_id, **kwargs)
+        if not result:
+            return None
+        await notify_pool_change(message.bot, pool_before, db.pool_info(), "Менеджер изменил вес тикета в пуле.")
+        lines = reprice_lines(result) or ["• Значение не изменилось"]
+        if field == "weight" and result["new"]["city_code"] == "msk" and result["new"]["weight_kg"] < 5.0:
+            lines.append("⚠️ <i>Вес меньше 5 кг для Москвы.</i>")
+        return lines
+    if field == "total":
+        value = parse_total(message.text)
+        old_total = db.set_total_rub(order_id, value)
+        if old_total is None:
+            return None
+        return [change_line("Итоговая сумма", fmt_rub(old_total), fmt_rub(value))]
+    if field == "desc_add":
+        value = clean_text(message.text, "Дополнение", 1000)
+        result = db.append_item_desc(order_id, value)
+        if not result:
+            return None
+        preview = value if len(value) <= 300 else value[:300] + "…"
+        return [f"• Дописано к деталям: <b>{escape(preview)}</b>"]
+    validators = {
+        "recipient": ("recipient_name", "Получатель", lambda raw: clean_text(raw, "ФИО", 200)),
+        "phone": ("recipient_phone", "Телефон", clean_phone),
+        "address": ("recipient_address", "Адрес", lambda raw: clean_text(raw, "Адрес", 500)),
+        "desc": ("item_desc", "Детали/ссылки", lambda raw: clean_text(raw, "Детали", 1500)),
+    }
+    column, label, validator = validators[field]
+    value = validator(message.text)
+    old = db.update_order_text_field(order_id, column, value)
+    if not old:
+        return None
+    if field == "desc":
+        preview = value if len(value) <= 300 else value[:300] + "…"
+        return [f"• Детали/ссылки заменены на: <b>{escape(preview)}</b>"]
+    return [change_line(label, old.get(column), value)]
